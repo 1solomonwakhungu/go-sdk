@@ -158,12 +158,12 @@ func (s *inFlightState) shuttingDown(errClosing error) error {
 	if s.readErr != nil {
 		// If the read side of the connection is broken, we cannot read new call
 		// requests, and cannot read responses to our outgoing calls.
-		return fmt.Errorf("%w: %v", errClosing, s.readErr)
+		return fmt.Errorf("%w: %w", errClosing, s.readErr)
 	}
 	if s.writeErr != nil {
 		// If the write side of the connection is broken, we cannot write responses
 		// for incoming calls, and cannot write requests for outgoing calls.
-		return fmt.Errorf("%w: %v", errClosing, s.writeErr)
+		return fmt.Errorf("%w: %w", errClosing, s.writeErr)
 	}
 	return nil
 }
@@ -671,7 +671,7 @@ func (c *Connection) handleAsync() {
 				if s.writeErr != nil {
 					// Assume that req.ctx was canceled due to s.writeErr.
 					// TODO(#51365): use a Context API to plumb this through req.ctx.
-					err = fmt.Errorf("%w: %v", ErrServerClosing, s.writeErr)
+					err = fmt.Errorf("%w: %w", ErrServerClosing, s.writeErr)
 				}
 			})
 			c.processResult("handleAsync", req, nil, err)
