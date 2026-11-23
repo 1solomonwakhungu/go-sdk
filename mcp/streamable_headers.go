@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -160,40 +159,156 @@ func lookupArgument(args map[string]json.RawMessage, path []string) (json.RawMes
 	return cur, true
 }
 
-// maxSafeInteger and minSafeInteger bound the integer values that can be
-// faithfully represented as IEEE-754 double-precision floats.
-const (
-	maxSafeInteger = 1<<53 - 1    // 2^53 - 1 = 9007199254740991
-	minSafeInteger = -(1<<53 - 1) // -(2^53 - 1) = -9007199254740991
-)
+// maxIntegerDigits caps the expanded decimal length of exponent-form integers
+// (such as 1e1000000) to avoid excessive allocation on untrusted input.
+const maxIntegerDigits = 1024
+
+// parseJSONInteger parses a JSON number string (RFC 8259 Section 6) that
+// represents an exact integer and returns its canonical base-10 string
+// representation (e.g. "42.0" -> "42", "1e2" -> "100", "-0" -> "0").
+// It returns ("", false) if s is not a valid JSON number, has a non-zero
+// fractional part, or expands beyond the digit limit.
+func parseJSONInteger(s string) (string, bool) {
+	if s == "" {
+		return "", false
+	}
+	i := 0
+	neg := false
+	if s[i] == '-' {
+		neg = true
+		i++
+		if i == len(s) {
+			return "", false
+		}
+	}
+
+	// Integer part: "0" or [1-9][0-9]*
+	intStart := i
+	if s[i] == '0' {
+		i++
+		if i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			return "", false
+		}
+	} else if s[i] >= '1' && s[i] <= '9' {
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+	} else {
+		return "", false
+	}
+	intPart := s[intStart:i]
+
+	// Optional fractional part: "." [0-9]+
+	var fracPart string
+	if i < len(s) && s[i] == '.' {
+		i++
+		fracStart := i
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+		if i == fracStart {
+			return "", false
+		}
+		fracPart = s[fracStart:i]
+	}
+
+	limit := max(int64(len(s)), maxIntegerDigits)
+
+	// Optional exponent part: ("e" | "E") ["+" | "-"] [0-9]+
+	var exp int64
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		i++
+		if i == len(s) {
+			return "", false
+		}
+		expNeg := false
+		if s[i] == '+' || s[i] == '-' {
+			expNeg = s[i] == '-'
+			i++
+		}
+		expStart := i
+		if i == len(s) {
+			return "", false
+		}
+		expCap := limit + int64(len(intPart)) + int64(len(fracPart))
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			if exp <= expCap {
+				exp = exp*10 + int64(s[i]-'0')
+			}
+			i++
+		}
+		if i == expStart {
+			return "", false
+		}
+		if expNeg {
+			exp = -exp
+		}
+	}
+
+	if i != len(s) {
+		return "", false
+	}
+
+	digits := intPart + fracPart
+	firstNonZero := 0
+	for firstNonZero < len(digits) && digits[firstNonZero] == '0' {
+		firstNonZero++
+	}
+	if firstNonZero == len(digits) {
+		return "0", true
+	}
+	lastNonZero := len(digits)
+	for lastNonZero > firstNonZero && digits[lastNonZero-1] == '0' {
+		lastNonZero--
+	}
+	sig := digits[firstNonZero:lastNonZero]
+	trailingZeros := int64(len(digits) - lastNonZero)
+	scale := exp - int64(len(fracPart)) + trailingZeros
+	if scale < 0 {
+		return "", false
+	}
+	if int64(len(sig))+scale > limit {
+		return "", false
+	}
+
+	var b strings.Builder
+	if neg {
+		b.WriteByte('-')
+	}
+	b.WriteString(sig)
+	for range scale {
+		b.WriteByte('0')
+	}
+	return b.String(), true
+}
 
 // unmarshalPrimitive unmarshals a JSON value into the Go representation used
 // for x-mcp-header processing per SEP-2243:
 //
 //   - JSON string  -> string
 //   - JSON boolean -> bool
-//   - JSON integer (within the JavaScript safe-integer range) -> int64
+//   - JSON integer -> int64 when it fits, or json.Number (canonical decimal) otherwise
 //
-// JSON numbers that are non-integers (have a fractional part, NaN, or ±Inf)
-// or integers outside the safe range are rejected because the `number` type
-// is not permitted for x-mcp-header parameters; only integer, string, boolean
-// are allowed.
+// Non-integer JSON numbers (those with a non-zero fractional part) and
+// non-primitive JSON values are rejected because only integer, string, and
+// boolean are allowed for x-mcp-header parameters.
 func unmarshalPrimitive(raw json.RawMessage) any {
 	var val any
-	if err := internaljson.Unmarshal(raw, &val); err != nil {
+	if err := internaljson.UnmarshalUseNumber(raw, &val); err != nil {
 		return nil
 	}
 	switch v := val.(type) {
 	case string, bool:
 		return v
-	case float64:
-		if math.IsNaN(v) || math.IsInf(v, 0) || v != math.Trunc(v) {
+	case json.Number:
+		canonical, ok := parseJSONInteger(v.String())
+		if !ok {
 			return nil
 		}
-		if v < minSafeInteger || v > maxSafeInteger {
-			return nil
+		if n, err := strconv.ParseInt(canonical, 10, 64); err == nil {
+			return n
 		}
-		return int64(v)
+		return json.Number(canonical)
 	default:
 		return nil
 	}
@@ -202,7 +317,7 @@ func unmarshalPrimitive(raw json.RawMessage) any {
 // primitiveToString formats an x-mcp-header value (as produced by
 // [unmarshalPrimitive]) to its canonical header string representation per
 // SEP-2243. Returns false if value is not one of the permitted primitive
-// types (string, bool, int64).
+// types (string, bool, int64, or an integer json.Number).
 func primitiveToString(value any) (string, bool) {
 	switch v := value.(type) {
 	case string:
@@ -211,6 +326,8 @@ func primitiveToString(value any) (string, bool) {
 		return fmt.Sprintf("%t", v), true
 	case int64:
 		return strconv.FormatInt(v, 10), true
+	case json.Number:
+		return parseJSONInteger(v.String())
 	default:
 		return "", false
 	}
@@ -591,24 +708,30 @@ func validateParamHeaders(header http.Header, msg *jsonrpc.Request, tool *Tool) 
 // primitiveEqual reports whether the (decoded) header string equals the
 // JSON-derived body value.
 func primitiveEqual(headerStr string, bodyVal any) bool {
-	if bodyInt, ok := bodyVal.(int64); ok {
-		headerNum, err := strconv.ParseFloat(headerStr, 64)
-		if err != nil {
+	switch v := bodyVal.(type) {
+	case int64:
+		headerCanonical, ok := parseJSONInteger(headerStr)
+		if !ok {
 			return false
 		}
-		if math.IsNaN(headerNum) || math.IsInf(headerNum, 0) || headerNum != math.Trunc(headerNum) {
+		return headerCanonical == strconv.FormatInt(v, 10)
+	case json.Number:
+		bodyCanonical, ok := parseJSONInteger(v.String())
+		if !ok {
 			return false
 		}
-		if headerNum < minSafeInteger || headerNum > maxSafeInteger {
+		headerCanonical, ok := parseJSONInteger(headerStr)
+		if !ok {
 			return false
 		}
-		return int64(headerNum) == bodyInt
+		return headerCanonical == bodyCanonical
+	default:
+		expected, ok := primitiveToString(bodyVal)
+		if !ok {
+			return false
+		}
+		return headerStr == expected
 	}
-	expected, ok := primitiveToString(bodyVal)
-	if !ok {
-		return false
-	}
-	return headerStr == expected
 }
 
 // encodeHeaderValue converts a parameter value to an HTTP header-safe string
