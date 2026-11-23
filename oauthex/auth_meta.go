@@ -199,7 +199,9 @@ func validateAuthServerMetaURLs(asm *AuthServerMeta) error {
 	}{
 		{"authorization_endpoint", asm.AuthorizationEndpoint},
 		{"token_endpoint", asm.TokenEndpoint},
+		{"jwks_uri", asm.JWKSURI},
 		{"registration_endpoint", asm.RegistrationEndpoint},
+		{"revocation_endpoint", asm.RevocationEndpoint},
 		{"introspection_endpoint", asm.IntrospectionEndpoint},
 	}
 

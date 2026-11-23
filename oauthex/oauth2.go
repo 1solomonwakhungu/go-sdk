@@ -102,8 +102,8 @@ func checkHTTPSOrLoopback(addr string) error {
 	if err != nil {
 		return err
 	}
-	if !util.IsLoopback(u.Host) && u.Scheme != "https" {
-		return fmt.Errorf("URL %q does not use HTTPS or is not a loopback address", addr)
+	if u.Scheme != "https" && (u.Scheme != "http" || !util.IsLoopback(u.Host)) {
+		return fmt.Errorf("URL %q must use HTTPS or HTTP on a loopback address", addr)
 	}
 	if ip, err := netip.ParseAddr(u.Hostname()); err == nil && util.IsPrivateOrReserved(ip) {
 		return fmt.Errorf("URL %q refers to a non-public address", addr)
