@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -1239,7 +1240,7 @@ func TestSetStandardHeadersWithParamHeaders(t *testing.T) {
 			},
 		},
 		{
-			name: "out-of-range integer argument produces no header",
+			name: "handles integer above 2^53-1",
 			tool: &Tool{
 				Name: "test",
 				InputSchema: map[string]any{
@@ -1251,7 +1252,45 @@ func TestSetStandardHeadersWithParamHeaders(t *testing.T) {
 			},
 			params: &CallToolParams{
 				Name:      "test",
-				Arguments: map[string]any{"count": float64(maxSafeInteger) + 2},
+				Arguments: map[string]any{"count": int64(9007199254740992)},
+			},
+			wantHeaders: map[string]string{
+				"Mcp-Param-Count": "9007199254740992",
+			},
+		},
+		{
+			name: "handles integer outside int64 range",
+			tool: &Tool{
+				Name: "test",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"count": map[string]any{"type": "integer", "x-mcp-header": "Count"},
+					},
+				},
+			},
+			params: &CallToolParams{
+				Name:      "test",
+				Arguments: map[string]any{"count": uint64(math.MaxUint64)},
+			},
+			wantHeaders: map[string]string{
+				"Mcp-Param-Count": "18446744073709551615",
+			},
+		},
+		{
+			name: "fractional number argument produces no header",
+			tool: &Tool{
+				Name: "test",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"count": map[string]any{"type": "integer", "x-mcp-header": "Count"},
+					},
+				},
+			},
+			params: &CallToolParams{
+				Name:      "test",
+				Arguments: map[string]any{"count": 3.14},
 			},
 			wantHeaders: nil,
 		},
@@ -1321,6 +1360,13 @@ func TestSetStandardHeadersWithParamHeaders(t *testing.T) {
 			for h, want := range tt.wantHeaders {
 				if got := header.Get(h); got != want {
 					t.Errorf("%s = %q, want %q", h, got, want)
+				}
+			}
+			if len(tt.wantHeaders) == 0 {
+				for h := range header {
+					if strings.HasPrefix(h, paramHeaderPrefix) {
+						t.Errorf("unexpected param header %s = %q", h, header.Get(h))
+					}
 				}
 			}
 
@@ -1492,21 +1538,33 @@ func TestUnmarshalPrimitive(t *testing.T) {
 		{"true", `true`, true},
 		{"false", `false`, false},
 
-		// Integer JSON numbers are promoted to int64.
+		// Integer JSON numbers are promoted to int64 when in range, or
+		// canonical json.Number otherwise.
 		{"integer", `42`, int64(42)},
 		{"integer zero", `0`, int64(0)},
+		{"negative zero", `-0.0`, int64(0)},
 		{"integer negative", `-7`, int64(-7)},
-		{"integer max safe", `9007199254740991`, int64(maxSafeInteger)},
-		{"integer min safe", `-9007199254740991`, int64(minSafeInteger)},
+		{"integer max safe", `9007199254740991`, int64(9007199254740991)},
+		{"integer min safe", `-9007199254740991`, int64(-9007199254740991)},
+		{"integer 2^53", `9007199254740992`, int64(9007199254740992)},
+		{"integer above max safe", `9007199254740993`, int64(9007199254740993)},
+		{"integer below min safe", `-9007199254740993`, int64(-9007199254740993)},
+		{"max int64", `9223372036854775807`, int64(math.MaxInt64)},
+		{"min int64", `-9223372036854775808`, int64(math.MinInt64)},
+		{"max uint64", `18446744073709551615`, json.Number("18446744073709551615")},
+		{"integer exponent", `1e2`, int64(100)},
+		{"large integer exponent", `1e20`, json.Number("100000000000000000000")},
+		{"negative exponent integer", `420e-1`, int64(42)},
 		// JSON serialization of an integer-valued float (e.g. "42.0") is
 		// still a valid integer at the value level and must be accepted.
 		{"integer-valued float", `42.0`, int64(42)},
 
-		// Non-integer numbers, out-of-range integers, and disallowed JSON
-		// kinds are rejected (return nil).
+		// Non-integer numbers, overly large exponent expansions, and disallowed
+		// JSON kinds are rejected (return nil).
 		{"float with fraction", `3.14`, nil},
-		{"integer above max safe", `9007199254740993`, nil},
-		{"integer below min safe", `-9007199254740993`, nil},
+		{"large half fraction", `9007199254740990.5`, nil},
+		{"negative exponent fraction", `425e-1`, nil},
+		{"excessive exponent", `1e10000`, nil},
 		{"null", `null`, nil},
 		{"array", `[1,2]`, nil},
 		{"object", `{"a":1}`, nil},
@@ -1551,8 +1609,12 @@ func TestEncodeHeaderValue(t *testing.T) {
 		{"integer", int64(42), "42", true},
 		{"integer zero", int64(0), "0", true},
 		{"integer negative", int64(-7), "-7", true},
-		{"integer max safe", int64(maxSafeInteger), "9007199254740991", true},
-		{"integer min safe", int64(minSafeInteger), "-9007199254740991", true},
+		{"integer max safe", int64(9007199254740991), "9007199254740991", true},
+		{"integer min safe", int64(-9007199254740991), "-9007199254740991", true},
+		{"integer 2^53", int64(9007199254740992), "9007199254740992", true},
+		{"integer max int64", int64(math.MaxInt64), "9223372036854775807", true},
+		{"integer json.Number uint64", json.Number("18446744073709551615"), "18446744073709551615", true},
+		{"fractional json.Number rejected", json.Number("3.14"), "", false},
 
 		// Booleans
 		{"true", true, "true", true},
@@ -1665,9 +1727,20 @@ func TestValidateParamHeaders_IntegerComparison(t *testing.T) {
 		{"scientific notation header matches integer body", "1e2", float64(100), false},
 		{"negative non-canonical header matches", "-7.0", float64(-7), false},
 
+		// Large integers beyond 2^53-1 are compared exactly.
+		{"2^53 integer matches", "9007199254740992", int64(9007199254740992), false},
+		{"2^53+1 integer matches", "9007199254740993", int64(9007199254740993), false},
+		{"negative large integer matches", "-9007199254740993", int64(-9007199254740993), false},
+		{"max int64 matches", "9223372036854775807", int64(math.MaxInt64), false},
+		{"min int64 matches", "-9223372036854775808", int64(math.MinInt64), false},
+		{"max uint64 matches", "18446744073709551615", uint64(math.MaxUint64), false},
+		{"large scientific notation header matches", "1e20", json.Number("100000000000000000000"), false},
+
 		// Genuine mismatches and invalid forms are still rejected.
 		{"different integers do not match", "42", float64(43), true},
+		{"adjacent large integers do not match", "9007199254740992", int64(9007199254740993), true},
 		{"fractional header against integer body", "3.14", float64(3), true},
+		{"integer header against fractional large body", "9007199254740990", json.Number("9007199254740990.5"), true},
 		{"non-numeric header fails", "not-a-number", float64(42), true},
 		{"header outside safe range against integer body", "9007199254740993", float64(42), true},
 	}
@@ -1846,6 +1919,54 @@ func TestParamHeaderEmptyStringRoundTrip(t *testing.T) {
 	lookup := func(string) (*serverTool, bool) { return &serverTool{tool: tool}, true }
 	if err := validateMcpHeaders(header, msg, lookup); err != nil {
 		t.Errorf("validateMcpHeaders() on client-generated headers = %v, want nil", err)
+	}
+}
+
+// TestParamHeaderLargeIntegerRoundTrip verifies that client header generation
+// and server header validation agree for integer arguments outside ±(2^53-1).
+func TestParamHeaderLargeIntegerRoundTrip(t *testing.T) {
+	tool := &Tool{
+		Name: "test",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"count": map[string]any{"type": "integer", "x-mcp-header": "Count"},
+			},
+		},
+	}
+	lookup := func(string) (*serverTool, bool) { return &serverTool{tool: tool}, true }
+
+	tests := []struct {
+		name       string
+		arg        any
+		wantHeader string
+	}{
+		{"2^53", int64(9007199254740992), "9007199254740992"},
+		{"2^53+1", int64(9007199254740993), "9007199254740993"},
+		{"-2^53", int64(-9007199254740992), "-9007199254740992"},
+		{"-2^53-1", int64(-9007199254740993), "-9007199254740993"},
+		{"max int64", int64(math.MaxInt64), "9223372036854775807"},
+		{"min int64", int64(math.MinInt64), "-9223372036854775808"},
+		{"max uint64", uint64(math.MaxUint64), "18446744073709551615"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := &jsonrpc.Request{
+				Method: "tools/call",
+				Params: mustMarshal(&CallToolParams{Name: "test", Arguments: map[string]any{"count": tt.arg}}),
+			}
+			header := http.Header{}
+			header.Set(protocolVersionHeader, minVersionForStandardHeaders)
+			setStandardHeaders(context.WithValue(context.Background(), toolContextKey, tool), header, msg)
+
+			if got := header.Values(paramHeaderPrefix + "Count"); len(got) != 1 || got[0] != tt.wantHeader {
+				t.Fatalf("Mcp-Param-Count = %q, want [%q]", got, tt.wantHeader)
+			}
+			if err := validateMcpHeaders(header, msg, lookup); err != nil {
+				t.Errorf("validateMcpHeaders() on client-generated headers = %v, want nil", err)
+			}
+		})
 	}
 }
 
