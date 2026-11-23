@@ -111,6 +111,55 @@ func TestValidateAuthServerMetaURLs(t *testing.T) {
 			t.Errorf("validateAuthServerMetaURLs(): got err %v, want nil", err)
 		}
 	})
+
+	// Endpoint URLs must use HTTPS or HTTP on a loopback address and must not
+	// target private or link-local addresses.
+	endpointFields := []struct {
+		name     string
+		setField func(*AuthServerMeta, string)
+	}{
+		{"authorization_endpoint", func(m *AuthServerMeta, v string) { m.AuthorizationEndpoint = v }},
+		{"token_endpoint", func(m *AuthServerMeta, v string) { m.TokenEndpoint = v }},
+		{"jwks_uri", func(m *AuthServerMeta, v string) { m.JWKSURI = v }},
+		{"registration_endpoint", func(m *AuthServerMeta, v string) { m.RegistrationEndpoint = v }},
+		{"revocation_endpoint", func(m *AuthServerMeta, v string) { m.RevocationEndpoint = v }},
+		{"introspection_endpoint", func(m *AuthServerMeta, v string) { m.IntrospectionEndpoint = v }},
+	}
+
+	disallowedEndpointURLs := []struct {
+		label string
+		url   string
+	}{
+		{"plaintext http", "http://auth.example.com/endpoint"},
+		{"http imds", "http://169.254.169.254/latest/meta-data/"},
+		{"https imds", "https://169.254.169.254/latest/meta-data/"},
+		{"https private ip", "https://10.0.0.1/endpoint"},
+		{"file loopback", "file://localhost/etc/passwd"},
+		{"ftp loopback", "ftp://127.0.0.1/endpoint"},
+	}
+
+	for _, field := range endpointFields {
+		for _, tc := range disallowedEndpointURLs {
+			t.Run(field.name+" rejects "+tc.label, func(t *testing.T) {
+				meta := *validMeta
+				field.setField(&meta, tc.url)
+				err := validateAuthServerMetaURLs(&meta)
+				if err == nil {
+					t.Errorf("validateAuthServerMetaURLs() with %s=%q: got nil, want error", field.name, tc.url)
+				} else if !strings.Contains(err.Error(), field.name) {
+					t.Errorf("validateAuthServerMetaURLs() with %s=%q: got error %v, want error containing %q", field.name, tc.url, err, field.name)
+				}
+			})
+		}
+
+		t.Run(field.name+" allows http loopback", func(t *testing.T) {
+			meta := *validMeta
+			field.setField(&meta, "http://localhost:8080/endpoint")
+			if err := validateAuthServerMetaURLs(&meta); err != nil {
+				t.Errorf("validateAuthServerMetaURLs() with %s=http://localhost:8080/endpoint: got err %v, want nil", field.name, err)
+			}
+		})
+	}
 }
 
 // TestValidateClientRegistrationURLs tests validation of ClientRegistrationMetadata URL fields.
